@@ -1,0 +1,51 @@
+TargetTrace — Running Manual
+=============================
+
+ONE-TIME SETUP
+---------------
+
+1. Install the venv package (Debian/Ubuntu only, if not already present):
+   sudo apt install -y python3.12-venv
+
+2. Create the virtual environment (from the TargetTrace-main/ directory):
+   python3 -m venv .venv
+
+3. Activate it:
+   source .venv/bin/activate
+
+4. Upgrade pip and install dependencies:
+   pip install --upgrade pip
+   pip install -r requirements.txt
+
+   GPU users: this installs a CUDA-enabled PyTorch build automatically if
+   available. To force a specific CUDA version instead, run afterwards:
+   pip install torch --index-url https://download.pytorch.org/whl/cu121
+
+5. Seed the database from the local ChEMBL chunk files (one-time):
+   python bootstrap.py --chunks-dir protein_data_chunks --limit 200
+
+
+EVERY TIME YOU WANT TO RUN THE APP
+------------------------------------
+
+1. Activate the environment:
+   source .venv/bin/activate
+
+2. Launch Streamlit:
+   streamlit run app.py
+
+3. Open the app in a browser at:
+   http://localhost:8501
+
+   To run headless / in the background:
+   streamlit run app.py --server.headless true &
+
+   To stop it:
+   pkill -f "streamlit run app.py"
+
+
+NOTES
+-----
+- Python 3.10+ required (tested with 3.12).
+- Re-run bootstrap.py only if bioactivity.db is missing or you want to
+  reseed with a different --limit.
