@@ -1,6 +1,9 @@
+import copy
 import gc
 import itertools
+import json
 import pickle
+import random
 import time as _time
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
@@ -78,10 +81,23 @@ def _bedroc(y_true, y_score, alpha: float = 20.0) -> float:
 
 # ── Helpers ────────────────────────────────────────────────────────────────
 
-def _fast_stratified_sample(df: pd.DataFrame, max_samples: int) -> pd.DataFrame:
+def _seed_everything(seed: int) -> torch.Generator:
+    """Seed python, numpy and torch; returns a torch Generator for DataLoader shuffling."""
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+    g = torch.Generator()
+    g.manual_seed(seed)
+    return g
+
+
+def _fast_stratified_sample(df: pd.DataFrame, max_samples: int,
+                            seed: int = 42) -> pd.DataFrame:
     """Vectorized stratified sample — keeps target distribution intact."""
     frac = max_samples / len(df)
-    rng  = np.random.default_rng(42)
+    rng  = np.random.default_rng(seed)
     df   = df.copy()
     df["_r"]  = rng.random(len(df))
     df["_rk"] = df.groupby("target_name", sort=False)["_r"].rank(method="first")
@@ -181,6 +197,41 @@ def _double_cold_split(df: pd.DataFrame, val_frac: float = 0.2, seed: int = 42):
     return train_df, val_df, False
 
 
+def _split_once(df: pd.DataFrame, split_mode: str, frac: float, seed: int):
+    """One held-out split under split_mode. Returns (rest_df, held_df, fell_back)."""
+    if split_mode == "cold_target":
+        return (*_cold_target_split(df, val_frac=frac, seed=seed), False)
+    if split_mode == "double_cold":
+        return _double_cold_split(df, val_frac=frac, seed=seed)
+    return (*_scaffold_split(df, val_frac=frac, seed=seed), False)
+
+
+def _three_way_split(df: pd.DataFrame, split_mode: str,
+                     val_frac: float, test_frac: float, seed: int):
+    """
+    Train / validation / test split, applying the same split rule twice:
+    first the test partition is held out of the full data, then the validation
+    partition is held out of the remainder. Validation is used for checkpoint
+    selection and early stopping only; test is scored once, after training.
+    Returns (train_df, val_df, test_df, fell_back).
+    """
+    rest_df, test_df, fb1 = _split_once(df, split_mode, test_frac, seed)
+    val_frac_of_rest = val_frac / max(1e-9, 1.0 - test_frac)
+    train_df, val_df, fb2 = _split_once(rest_df, split_mode, val_frac_of_rest, seed + 1)
+    return train_df, val_df, test_df, (fb1 or fb2)
+
+
+def _partition_summary(name: str, part: pd.DataFrame) -> dict:
+    return {
+        "partition": name,
+        "pairs":     int(len(part)),
+        "compounds": int(part["smiles"].nunique()),
+        "targets":   int(part["target_name"].nunique()),
+        "actives":   int((part["active"] == 1).sum()),
+        "inactives": int((part["active"] == 0).sum()),
+    }
+
+
 def _load_caches_parallel(needed_smiles: set, status_cb=None) -> tuple:
     """Load FP subset and protein pool in parallel threads."""
     done = [0]
@@ -243,6 +294,10 @@ class TargetTrace3Dataset(Dataset):
                            .sub(pic50_mean).div(pic50_std))
 
         self._smiles_arr   = df2["smiles"].tolist()
+        self._target_arr   = df2["target_name"].tolist()
+        self._active_arr   = (df2["active"].to_numpy(dtype=np.int64)
+                              if "active" in df2.columns
+                              else np.ones(len(df2), dtype=np.int64))
         self._prot_key_arr = df2["prot_key"].tolist()
         self._prot_idx_arr = df2["prot_idx"].to_numpy(dtype=np.int32)
         self._pic50_arr    = df2["pic50_n"].to_numpy(dtype=np.float32)
@@ -259,6 +314,142 @@ class TargetTrace3Dataset(Dataset):
             int(self._prot_idx_arr[idx]),
             float(self._pic50_arr[idx]),
         )
+
+
+def _evaluate(model, loader, ds: "TargetTrace3Dataset",
+              prot_res_t, prot_mask_t, p_mean: float, p_std: float,
+              seed: int, prot_idx_to_target: dict) -> tuple[dict, pd.DataFrame]:
+    """
+    Score a held-out partition (loader must not shuffle).
+
+    Every row is scored against its own protein and labelled by its measured
+    `active` value, so real inactives count as negatives. Each active row also
+    gets one protein-shuffle decoy (the molecule paired with another row's
+    protein, both residues AND pooled ESM-2 swapped), labelled 0; decoys that
+    land on the same protein are dropped. Decoy draws come from a fixed-seed
+    generator, so every epoch scores the same decoys.
+
+    Metrics:
+      AUC / AUPRC / EF / BEDROC — actives vs (real inactives + decoys);
+                                   used for checkpoint selection
+      AUC_real                  — actives vs real inactives only
+      AUC_decoy                 — actives vs protein-shuffle decoys only
+    Returns (metrics, per-pair prediction table).
+    """
+    model.eval()
+    gen = torch.Generator(device="cpu")
+    gen.manual_seed(seed)
+
+    scores, decoy_rows = [], []
+    p50_preds = []
+    offset = 0
+    with torch.no_grad():
+        for fp, esm_p, prot_idx, pic50s in loader:
+            B = len(fp)
+            neg_perm = torch.randperm(B, generator=gen)
+            fp, esm_p, prot_idx = [b.to(device, non_blocking=True)
+                                   for b in [fp, esm_p, prot_idx]]
+            neg_perm = neg_perm.to(device)
+
+            with autocast(device_type="cuda", enabled=USE_AMP):
+                act_pos, p50_pos = model(fp, esm_p, prot_res_t[prot_idx],
+                                         prot_mask_t[prot_idx])
+                neg_idx = prot_idx[neg_perm]
+                act_neg, _ = model(fp, esm_p[neg_perm], prot_res_t[neg_idx],
+                                   prot_mask_t[neg_idx])
+            scores.extend(torch.sigmoid(act_pos).cpu().float().numpy().tolist())
+            p50_preds.extend((p50_pos.cpu().float().numpy() * p_std + p_mean).tolist())
+
+            neg_s    = torch.sigmoid(act_neg).cpu().float().numpy()
+            neg_idx  = neg_idx.cpu().numpy()
+            own_idx  = prot_idx.cpu().numpy()
+            for j in range(B):
+                row = offset + j
+                if ds._active_arr[row] == 1 and neg_idx[j] != own_idx[j]:
+                    decoy_rows.append((row, int(neg_idx[j]), float(neg_s[j])))
+            offset += B
+
+    scores  = np.asarray(scores, dtype=np.float64)
+    labels  = ds._active_arr[:len(scores)].astype(int)
+    pic50_t = ds._pic50_arr[:len(scores)] * p_std + p_mean
+
+    pos_s  = scores[labels == 1]
+    inact_s = scores[labels == 0]
+    dec_s  = np.array([d[2] for d in decoy_rows], dtype=np.float64)
+
+    def _auc(pos, neg):
+        if len(pos) == 0 or len(neg) == 0:
+            return float("nan")
+        y = np.r_[np.ones(len(pos)), np.zeros(len(neg))]
+        return float(roc_auc_score(y, np.r_[pos, neg]))
+
+    y_true_a  = np.r_[np.ones(len(pos_s)), np.zeros(len(inact_s) + len(dec_s))]
+    y_score_a = np.r_[pos_s, inact_s, dec_s]
+    has_both  = len(np.unique(y_true_a)) == 2
+
+    m = {
+        "AUC":       float(roc_auc_score(y_true_a, y_score_a)) if has_both else float("nan"),
+        "AUPRC":     float(average_precision_score(y_true_a, y_score_a)) if has_both else float("nan"),
+        "AUC_real":  _auc(pos_s, inact_s),
+        "AUC_decoy": _auc(pos_s, dec_s),
+        "EF1%":      _ef(y_true_a, y_score_a, 0.01),
+        "EF5%":      _ef(y_true_a, y_score_a, 0.05),
+        "BEDROC":    _bedroc(y_true_a, y_score_a),
+        "n_actives":   int(len(pos_s)),
+        "n_inactives": int(len(inact_s)),
+        "n_decoys":    int(len(dec_s)),
+    }
+    if has_both:
+        fpr, tpr, _ = roc_curve(y_true_a, y_score_a)
+        step = max(1, len(fpr) // 200)
+        m["_roc"] = list(zip(fpr[::step].tolist(), tpr[::step].tolist()))
+        prec_c, rec_c, _ = precision_recall_curve(y_true_a, y_score_a)
+        step = max(1, len(prec_c) // 200)
+        m["_pr"] = list(zip(rec_c[::step].tolist(), prec_c[::step].tolist()))
+    else:
+        m["_roc"] = m["_pr"] = []
+
+    # pIC50 regression on rows with a measured value, scored against own protein
+    p50_preds = np.asarray(p50_preds, dtype=np.float64)
+    ok = ~np.isnan(pic50_t)
+    if ok.sum() >= 2:
+        pt_a, pp_a = pic50_t[ok], p50_preds[ok]
+        sr  = _spearmanr(pt_a, pp_a)
+        pr_ = _pearsonr(pt_a, pp_a)
+        m["pIC50 MAE"]  = float(np.mean(np.abs(pt_a - pp_a)))
+        m["pIC50 RMSE"] = float(np.sqrt(np.mean((pt_a - pp_a) ** 2)))
+        m["Spearman"]   = float(getattr(sr,  "statistic", getattr(sr,  "correlation", 0.0)))
+        m["Pearson"]    = float(getattr(pr_, "statistic", pr_[0] if isinstance(pr_, tuple) else 0.0))
+        n_s   = min(len(pt_a), 500)
+        idx_s = (np.random.default_rng(seed).choice(len(pt_a), n_s, replace=False)
+                 if len(pt_a) > n_s else np.arange(len(pt_a)))
+        m["_scatter"] = list(zip(pt_a[idx_s].tolist(), pp_a[idx_s].tolist()))
+    else:
+        m["pIC50 MAE"] = m["pIC50 RMSE"] = m["Spearman"] = m["Pearson"] = 0.0
+        m["_scatter"] = []
+
+    n = len(scores)
+    preds = pd.DataFrame({
+        "smiles":      ds._smiles_arr[:n],
+        "target_name": ds._target_arr[:n],
+        "kind":        "measured",
+        "label":       labels,
+        "score":       scores,
+        "pic50_true":  pic50_t,
+        "pic50_pred":  p50_preds,
+    })
+    if decoy_rows:
+        decoys = pd.DataFrame({
+            "smiles":      [ds._smiles_arr[r] for r, _, _ in decoy_rows],
+            "target_name": [prot_idx_to_target.get(pi, "") for _, pi, _ in decoy_rows],
+            "kind":        "decoy",
+            "label":       0,
+            "score":       dec_s,
+            "pic50_true":  np.nan,
+            "pic50_pred":  np.nan,
+        })
+        preds = pd.concat([preds, decoys], ignore_index=True)
+    return m, preds
 
 
 def _collate(batch):
@@ -323,10 +514,28 @@ def train(
     status_cb:   Callable[[str], None] | None = None,
     model_factory: Callable[[], TargetTrace3] | None = None,
     ckpt_dir:      Path | None = None,
+    seed:          int = 0,
+    split_seed:    int = 42,
+    val_frac:      float = 0.1,
+    test_frac:     float = 0.2,
+    resume:        bool = False,
 ) -> tuple[TargetTrace3 | None, list, list, np.ndarray | None, dict, list[dict], str]:
     """
     Returns (model, target_names, target_keys, target_prot_embs, norm_stats, epoch_log, message).
     split_mode: "scaffold" | "cold_target" | "double_cold"
+
+    Data are split three ways (train / validation / test, default 70/10/20).
+    Checkpoint selection and early stopping use validation only; the test
+    partition is scored once, with the best checkpoint, after training ends.
+    Per-pair validation and test predictions, partition sizes and test
+    metrics are written next to the checkpoint.
+
+    seed:       training seed (weight init, batch order, negatives). Vary this
+                for repeated runs on the same split.
+    split_seed: seed for subsampling and the train/val/test split.
+    resume:     warm-start from the latest checkpoint in MODELS_DIR (scaffold
+                split, default model only). Off by default: a checkpoint trained
+                on a different split may have seen this run's test pairs.
 
     model_factory: overrides the default TargetTrace3() constructor — e.g. to
         train an architectural ablation variant from scratch under the same
@@ -339,6 +548,7 @@ def train(
     save_dir = ckpt_dir or MODELS_DIR
     save_dir.mkdir(parents=True, exist_ok=True)
     t0 = _time.time()
+    loader_gen = _seed_everything(seed)
 
     def _status(msg: str):
         if status_cb:
@@ -355,23 +565,28 @@ def train(
     # ── 2. Stratified sample + scaffold split ───────────────────────────────
     if max_samples and len(df) > max_samples:
         _status(f"Step 2/5 — Sampling {max_samples:,} / {len(df):,}…")
-        df = _fast_stratified_sample(df, max_samples)
+        df = _fast_stratified_sample(df, max_samples, seed=split_seed)
     _status(f"Step 2/5 — Using {len(df):,} records")
 
     _split_label = {"scaffold": "scaffold", "cold_target": "cold-target", "double_cold": "double-cold"}
     _status(f"Step 2/5 — {_split_label.get(split_mode, split_mode)} split…")
-    if split_mode == "cold_target":
-        train_df, val_df = _cold_target_split(df, val_frac=0.2)
-    elif split_mode == "double_cold":
-        train_df, val_df, _dc_fell_back = _double_cold_split(df, val_frac=0.2)
-        if _dc_fell_back:
-            _status("Step 2/5 — WARNING: double-cold fell back to cold-target "
-                    "(insufficient cold-scaffold × cold-target pairs in this dataset)")
-    else:
-        train_df, val_df = _scaffold_split(df, val_frac=0.2)
-    _status(f"Step 2/5 — {len(train_df):,} train / {len(val_df):,} val  ({_time.time()-t0:.1f}s)")
+    train_df, val_df, test_df, _dc_fell_back = _three_way_split(
+        df, split_mode, val_frac=val_frac, test_frac=test_frac, seed=split_seed)
+    if _dc_fell_back:
+        _status("Step 2/5 — WARNING: double-cold fell back to cold-target "
+                "(insufficient cold-scaffold × cold-target pairs in this dataset)")
+    split_info = {
+        "split_mode": split_mode, "split_seed": split_seed, "seed": seed,
+        "val_frac": val_frac, "test_frac": test_frac,
+        "double_cold_fell_back": bool(_dc_fell_back),
+        "partitions": [_partition_summary("train", train_df),
+                       _partition_summary("val",   val_df),
+                       _partition_summary("test",  test_df)],
+    }
+    _status(f"Step 2/5 — {len(train_df):,} train / {len(val_df):,} val / "
+            f"{len(test_df):,} test  ({_time.time()-t0:.1f}s)")
 
-    # norm_stats from train only — val pic50 must not inform normalisation
+    # norm_stats from train only — val/test pic50 must not inform normalisation
     valid_p    = train_df["pic50"].dropna().astype(float)
     p_mean     = float(valid_p.mean()) if len(valid_p) > 0 else 7.0
     p_std      = max(float(valid_p.std()) if len(valid_p) > 1 else 1.5, 0.1)
@@ -424,6 +639,8 @@ def train(
                                    fp_cache, prot_pool, prot_key_to_idx, tgt_to_key)
     val_ds   = TargetTrace3Dataset(val_df,       p_mean, p_std,
                                    fp_cache, prot_pool, prot_key_to_idx, tgt_to_key)
+    test_ds  = TargetTrace3Dataset(test_df,      p_mean, p_std,
+                                   fp_cache, prot_pool, prot_key_to_idx, tgt_to_key)
     neg_train_ds = TargetTrace3Dataset(neg_train_df, p_mean, p_std,
                                        fp_cache, prot_pool, prot_key_to_idx, tgt_to_key)
     del fp_cache, prot_pool
@@ -433,7 +650,7 @@ def train(
         return None, [], [], None, {}, [], "Not enough valid samples after feature extraction."
 
     _status(f"Step 5/5 — {len(train_ds):,} pos-train | {len(neg_train_ds):,} real-neg | "
-            f"{len(val_ds):,} val ({len(unique_prot_keys)} proteins)  ({_time.time()-t0:.1f}s)")
+            f"{len(val_ds):,} val | {len(test_ds):,} test ({len(unique_prot_keys)} proteins)  ({_time.time()-t0:.1f}s)")
 
     # Preload all protein residue tensors to GPU once — fast lookup during training
     max_L      = max((r.shape[0] for r in residue_cache.values()), default=1)
@@ -455,10 +672,14 @@ def train(
                         pin_memory=(device.type == "cuda"))
     # drop_last=True: prevents 1-sample final batch crashing BatchNorm
     train_loader    = DataLoader(train_ds,     batch_size=512, shuffle=True,
-                                 drop_last=True, **loader_kw)
+                                 drop_last=True, generator=loader_gen, **loader_kw)
     val_loader      = DataLoader(val_ds,       batch_size=512, shuffle=False, **loader_kw)
+    test_loader     = DataLoader(test_ds,      batch_size=512, shuffle=False, **loader_kw)
     real_neg_loader = DataLoader(neg_train_ds, batch_size=256, shuffle=True,
-                                 drop_last=True, **loader_kw)
+                                 drop_last=True, generator=loader_gen, **loader_kw)
+    prot_idx_to_target = {}
+    for t in all_targets:
+        prot_idx_to_target.setdefault(prot_key_to_idx[tgt_to_key[t]], t)
 
     _status(f"Step 5/5 — GPU training  (device={device}, AMP={'on' if USE_AMP else 'off'})…")
     # Cold splits (and any custom model_factory, e.g. an ablation variant) must
@@ -466,7 +687,7 @@ def train(
     # prior knowledge (or an incompatible architecture) into the weights.
     if model_factory is not None:
         model = model_factory().to(device)
-    elif split_mode != "scaffold":
+    elif split_mode != "scaffold" or not resume:
         model = TargetTrace3().to(device)
     else:
         model = (_load_ckpt() or TargetTrace3()).to(device)
@@ -480,6 +701,8 @@ def train(
     no_improve   = 0
     best_val_auc = -1.0
     best_ckpt    = None
+    best_state   = None
+    best_val_preds = None
     last_loss = last_mae = 0.0
     epoch_log: list[dict] = []
     epochs_run = 0
@@ -513,8 +736,11 @@ def train(
             rn_res  = prot_res_t[rn_prot_idx]
             rn_mask = prot_mask_t[rn_prot_idx]
 
+            # The shuffle negative swaps BOTH protein views (residues and pooled
+            # ESM-2): models that read only the pooled vector (no cross-attention
+            # ablation) would otherwise see identical inputs with opposite labels.
             fp_all   = torch.cat([fp,       fp,        rn_fp  ])
-            esm_all  = torch.cat([esm_p,    esm_p,     rn_esm ])
+            esm_all  = torch.cat([esm_p,    esm_p[rand_perm], rn_esm ])
             res_all  = torch.cat([pos_res,  shuf_res,  rn_res ])
             mask_all = torch.cat([pos_mask, shuf_mask, rn_mask])
             act_lbl  = torch.cat([torch.ones(B,   device=device),
@@ -542,109 +768,42 @@ def train(
         scheduler.step()
         last_loss = total_loss / max(1, len(train_loader))
 
-        # Validation — AUC-ROC over positive + batch-negative pairs
-        model.eval()
-        y_act_true, y_act_score, pt, pp = [], [], [], []
-        with torch.no_grad():
-            for fp, esm_p, prot_idx, pic50s in val_loader:
-                fp, esm_p, prot_idx, pic50s = [b.to(device, non_blocking=True)
-                                                for b in [fp, esm_p, prot_idx, pic50s]]
-                B = len(fp)
-
-                pos_res  = prot_res_t[prot_idx]
-                pos_mask = prot_mask_t[prot_idx]
-                with autocast(device_type="cuda", enabled=USE_AMP):
-                    act_pos, p50_pos = model(fp, esm_p, pos_res, pos_mask)
-                y_act_true.extend([1] * B)
-                y_act_score.extend(torch.sigmoid(act_pos).cpu().float().numpy().tolist())
-
-                neg_perm = torch.randperm(B, device=device)
-                same     = neg_perm == torch.arange(B, device=device)
-                neg_perm[same] = (neg_perm[same] + 1) % B
-                neg_res  = prot_res_t[prot_idx[neg_perm]]
-                neg_mask = prot_mask_t[prot_idx[neg_perm]]
-                with autocast(device_type="cuda", enabled=USE_AMP):
-                    act_neg, _ = model(fp, esm_p, neg_res, neg_mask)
-                y_act_true.extend([0] * B)
-                y_act_score.extend(torch.sigmoid(act_neg).cpu().float().numpy().tolist())
-
-                for t, p in zip(pic50s.cpu().numpy(),
-                                p50_pos.cpu().float().numpy()):
-                    if not np.isnan(float(t)):
-                        pt.append(float(t) * p_std + p_mean)
-                        pp.append(float(p) * p_std + p_mean)
-
-        y_true_a  = np.array(y_act_true)
-        y_score_a = np.array(y_act_score)
-
-        val_auc   = roc_auc_score(y_true_a, y_score_a)
-        val_auprc = average_precision_score(y_true_a, y_score_a)
-        ef1       = _ef(y_true_a, y_score_a, 0.01)
-        ef5       = _ef(y_true_a, y_score_a, 0.05)
-        bedroc    = _bedroc(y_true_a, y_score_a)
-
-        # ROC and PR curves, downsampled to ≤200 points for storage
-        fpr, tpr, _ = roc_curve(y_true_a, y_score_a)
-        step = max(1, len(fpr) // 200)
-        roc_pts = list(zip(fpr[::step].tolist(), tpr[::step].tolist()))
-
-        prec_c, rec_c, _ = precision_recall_curve(y_true_a, y_score_a)
-        step = max(1, len(prec_c) // 200)
-        pr_pts = list(zip(rec_c[::step].tolist(), prec_c[::step].tolist()))
-
-        # pIC50 regression metrics
-        if len(pt) >= 2:
-            pt_a = np.array(pt, dtype=np.float32)
-            pp_a = np.array(pp, dtype=np.float32)
-            last_mae  = float(np.mean(np.abs(pt_a - pp_a)))
-            last_rmse = float(np.sqrt(np.mean((pt_a - pp_a) ** 2)))
-            sr   = _spearmanr(pt_a, pp_a)
-            pr_  = _pearsonr(pt_a, pp_a)
-            spear_r   = float(getattr(sr,  "statistic", getattr(sr,  "correlation", 0.0)))
-            pearson_r = float(getattr(pr_, "statistic", pr_[0] if isinstance(pr_, tuple) else 0.0))
-            n_s   = min(len(pt_a), 500)
-            idx_s = (np.random.choice(len(pt_a), n_s, replace=False)
-                     if len(pt_a) > n_s else np.arange(len(pt_a)))
-            scatter = list(zip(pt_a[idx_s].tolist(), pp_a[idx_s].tolist()))
-        else:
-            last_mae = last_rmse = spear_r = pearson_r = 0.0
-            scatter = []
+        # Validation — real actives vs real inactives + protein-shuffle decoys
+        vm, val_preds = _evaluate(model, val_loader, val_ds, prot_res_t, prot_mask_t,
+                                  p_mean, p_std, seed=split_seed,
+                                  prot_idx_to_target=prot_idx_to_target)
+        val_auc  = vm["AUC"]
+        last_mae = vm["pIC50 MAE"]
 
         epochs_run = epoch + 1
         entry = {
             "Epoch":      epochs_run,
             "Loss":       last_loss,
             "AUC":        val_auc,
-            "AUPRC":      val_auprc,
-            "EF1%":       ef1,
-            "EF5%":       ef5,
-            "BEDROC":     bedroc,
-            "pIC50 MAE":  last_mae,
-            "pIC50 RMSE": last_rmse,
-            "Spearman":   spear_r,
-            "Pearson":    pearson_r,
-            "_roc":       roc_pts,
-            "_pr":        pr_pts,
-            "_scatter":   scatter,
+            "AUC_real":   vm["AUC_real"],
+            "AUC_decoy":  vm["AUC_decoy"],
+            "AUPRC":      vm["AUPRC"],
+            "EF1%":       vm["EF1%"],
+            "EF5%":       vm["EF5%"],
+            "BEDROC":     vm["BEDROC"],
+            "pIC50 MAE":  vm["pIC50 MAE"],
+            "pIC50 RMSE": vm["pIC50 RMSE"],
+            "Spearman":   vm["Spearman"],
+            "Pearson":    vm["Pearson"],
+            "_roc":       vm["_roc"],
+            "_pr":        vm["_pr"],
+            "_scatter":   vm["_scatter"],
         }
         epoch_log.append(entry)
         if progress_cb:
             progress_cb(entry, epochs)
 
         if val_auc > best_val_auc:
-            best_val_auc = val_auc
-            no_improve   = 0
-            ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-            best_ckpt = save_dir / f"targettrace3_{ts}.pkl"
-            with open(best_ckpt, "wb") as f:
-                pickle.dump({
-                    "model":            model,
-                    "target_names":     all_targets,
-                    "target_keys":      all_keys,
-                    "target_prot_embs": target_prot_embs,
-                    "norm_stats":       norm_stats,
-                    "split_mode":       split_mode,
-                }, f)
+            best_val_auc   = val_auc
+            no_improve     = 0
+            best_state     = copy.deepcopy(model.state_dict())
+            best_val_preds = val_preds
+            best_epoch     = epochs_run
         else:
             no_improve += 1
             if no_improve >= patience:
@@ -652,7 +811,38 @@ def train(
                         f"(no AUC improvement for {patience} epochs)")
                 break
 
-    total_samples = len(train_ds) + len(val_ds)
+    # ── Final, single evaluation of the test partition with the best checkpoint
+    test_metrics: dict = {}
+    if best_state is not None:
+        model.load_state_dict(best_state)
+        tm, test_preds = _evaluate(model, test_loader, test_ds, prot_res_t, prot_mask_t,
+                                   p_mean, p_std, seed=split_seed + 1,
+                                   prot_idx_to_target=prot_idx_to_target)
+        test_metrics = {k: v for k, v in tm.items() if not k.startswith("_")}
+        _status(f"Test (scored once) — AUC {tm['AUC']:.3f} | AUC_real {tm['AUC_real']:.3f} | "
+                f"AUC_decoy {tm['AUC_decoy']:.3f} | AUPRC {tm['AUPRC']:.3f}")
+
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        best_ckpt = save_dir / f"targettrace3_{ts}.pkl"
+        split_info["best_epoch"]   = best_epoch
+        split_info["best_val_auc"] = best_val_auc
+        split_info["test_metrics"] = test_metrics
+        with open(best_ckpt, "wb") as f:
+            pickle.dump({
+                "model":            model,
+                "target_names":     all_targets,
+                "target_keys":      all_keys,
+                "target_prot_embs": target_prot_embs,
+                "norm_stats":       norm_stats,
+                "split_mode":       split_mode,
+                "split_info":       split_info,
+            }, f)
+        best_val_preds.to_csv(best_ckpt.with_name(best_ckpt.stem + "_val_preds.csv"), index=False)
+        test_preds.to_csv(best_ckpt.with_name(best_ckpt.stem + "_test_preds.csv"), index=False)
+        with open(best_ckpt.with_name(best_ckpt.stem + "_summary.json"), "w") as f:
+            json.dump(split_info, f, indent=2)
+
+    total_samples = len(train_ds) + len(val_ds) + len(test_ds)
     mark_all_trained()
     if best_ckpt:
         log_run(total_samples, len(all_targets), epochs_run, last_loss,
@@ -664,4 +854,7 @@ def train(
             f"Training complete — {epochs_run} epochs, {total_samples:,} samples, "
             f"{len(all_targets)} targets, {elapsed/60:.1f} min total.\n"
             f"Val AUC {best_val_auc:.3f}  |  AUPRC {best.get('AUPRC',0):.3f}  |  "
-            f"EF@1% {best.get('EF1%',0):.1f}×  |  pIC50 MAE {last_mae:.3f}")
+            f"EF@1% {best.get('EF1%',0):.1f}×  |  pIC50 MAE {best.get('pIC50 MAE',0):.3f}\n"
+            f"Test AUC {test_metrics.get('AUC', float('nan')):.3f}  |  "
+            f"AUC_real {test_metrics.get('AUC_real', float('nan')):.3f}  |  "
+            f"AUPRC {test_metrics.get('AUPRC', float('nan')):.3f}")
