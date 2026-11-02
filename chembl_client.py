@@ -1,4 +1,4 @@
-"""ChEMBL API helpers — wraps chembl_webresource_client."""
+
 import time
 
 import pandas as pd

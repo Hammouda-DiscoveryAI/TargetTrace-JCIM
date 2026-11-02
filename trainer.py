@@ -1,3 +1,4 @@
+
 import gc
 import itertools
 import pickle
@@ -514,7 +515,12 @@ def train(
             rn_mask = prot_mask_t[rn_prot_idx]
 
             fp_all   = torch.cat([fp,       fp,        rn_fp  ])
-            esm_all  = torch.cat([esm_p,    esm_p,     rn_esm ])
+            # NOTE (2026 correction): the shuffled-negative branch must carry the
+            # SHUFFLED protein's pooled embedding. Permuting only the residue
+            # tensors left the pooled vector belonging to the true partner, so a
+            # model reading only `esm_pooled` saw identical inputs for the
+            # positive and negative class and could not exceed chance.
+            esm_all  = torch.cat([esm_p,    esm_p[rand_perm], rn_esm ])
             res_all  = torch.cat([pos_res,  shuf_res,  rn_res ])
             mask_all = torch.cat([pos_mask, shuf_mask, rn_mask])
             act_lbl  = torch.cat([torch.ones(B,   device=device),
@@ -542,7 +548,17 @@ def train(
         scheduler.step()
         last_loss = total_loss / max(1, len(train_loader))
 
-        # Validation — AUC-ROC over positive + batch-negative pairs
+        # Validation — AUC-ROC over positive + batch-negative pairs.
+        #
+        # CAVEAT: this in-app metric scores every real validation pair as a
+        # positive against protein-shuffled negatives, so it measures
+        # protein-identity discrimination, NOT active-vs-inactive potency
+        # discrimination, and the negatives are re-drawn each epoch. It is a
+        # training-progress signal for the application, not the evaluation
+        # protocol used in the paper. The published protocol — a three-way
+        # scaffold split, fixed and labelled validation/test sets, checkpoint
+        # selection on validation only, and the test partition scored once —
+        # lives in reproduce/trainer_r2.py.
         model.eval()
         y_act_true, y_act_score, pt, pp = [], [], [], []
         with torch.no_grad():
@@ -564,7 +580,9 @@ def train(
                 neg_res  = prot_res_t[prot_idx[neg_perm]]
                 neg_mask = prot_mask_t[prot_idx[neg_perm]]
                 with autocast(device_type="cuda", enabled=USE_AMP):
-                    act_neg, _ = model(fp, esm_p, neg_res, neg_mask)
+                    # same correction as the training loop: shuffle the pooled
+                    # embedding together with the residues
+                    act_neg, _ = model(fp, esm_p[neg_perm], neg_res, neg_mask)
                 y_act_true.extend([0] * B)
                 y_act_score.extend(torch.sigmoid(act_neg).cpu().float().numpy().tolist())
 
